@@ -21,7 +21,9 @@ SHARED_NODES = (ast.expr_context, ast.operator, ast.boolop, ast.unaryop, ast.cmp
 
 TEXT = st.text(alphabet=st.characters(blacklist_categories=["Cs"]))
 FILENAMES = st.text(
-    alphabet=st.characters(blacklist_categories=["Cs"]), min_size=1, max_size=20
+    alphabet=st.characters(blacklist_categories=["Cs"], blacklist_characters="\x00"),
+    min_size=1,
+    max_size=20,
 )
 
 names = st.from_regex(r"[a-z_][a-z0-9_]{0,6}", fullmatch=True).filter(

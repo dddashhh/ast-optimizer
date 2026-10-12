@@ -85,6 +85,36 @@ def test_from_string_rejects_wrong_type(bad):
         SourceLoader().from_string(bad)
 
 
+@given(FILENAMES, FILENAMES)
+def test_from_string_rejects_null_in_filename(head, tail):
+    with pytest.raises(InvalidSourceError):
+        SourceLoader().from_string("x = 1", filename=head + "\x00" + tail)
+
+
+@given(wrong_types)
+def test_from_string_rejects_non_str_filename(bad):
+    with pytest.raises(InvalidSourceError):
+        SourceLoader().from_string("x = 1", filename=bad)
+
+
+@given(wrong_types)
+def test_from_file_rejects_wrong_path_type(bad):
+    with pytest.raises(InvalidSourceError):
+        SourceLoader().from_file(bad)
+
+
+def test_from_file_os_error_becomes_invalid_source_error(tmp_path, monkeypatch):
+    path = tmp_path / "prog.py"
+    path.write_text("x = 1")
+
+    def denied(self):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "read_bytes", denied)
+    with pytest.raises(InvalidSourceError):
+        SourceLoader().from_file(path)
+
+
 @FILE_SETTINGS
 @given(
     TEXT.filter(lambda t: "\r" not in t and not t.startswith("\ufeff")),
@@ -221,6 +251,26 @@ def test_validator_result_is_consistent(text):
             res.raise_if_invalid()
 
 
+def test_raise_if_invalid_without_error_still_raises():
+    with pytest.raises(InvalidSourceError):
+        ValidationResult(is_valid=False).raise_if_invalid()
+
+
+@given(
+    st.text(max_size=20),
+    st.one_of(st.none(), st.integers(1, 10000)),
+    st.one_of(st.none(), st.integers(1, 500)),
+)
+def test_python_syntax_error_str(message, lineno, offset):
+    text = str(PythonSyntaxError(message, lineno, offset))
+    if lineno is None:
+        assert text == message
+    elif offset is None:
+        assert text == f"{message} (строка {lineno})"
+    else:
+        assert text == f"{message} (строка {lineno}, столбец {offset})"
+
+
 @given(any_texts)
 def test_validator_and_parser_agree(text):
     src = SourceCode(text)
@@ -250,6 +300,12 @@ def test_parse_error_is_project_error_with_lineno(case):
     with pytest.raises(PythonSyntaxError) as exc:
         CodeParser().parse(SourceCode(text))
     assert exc.value.lineno == lineno
+
+
+@given(null_texts)
+def test_parse_null_bytes_is_project_error(text):
+    with pytest.raises(InvalidSourceError):
+        CodeParser().parse(SourceCode(text))
 
 
 @FIXTURE_OK
@@ -389,3 +445,10 @@ def test_validator_is_replaceable(text, message):
     with pytest.raises(InvalidSourceError) as exc:
         InputPipeline(validator=RejectAll(message)).process(text)
     assert message in str(exc.value)
+
+
+@settings(max_examples=20)
+@given(st.integers(1, 1500))
+def test_deeply_nested_unary_never_leaks_recursion_error(depth):
+    tree, err = InputPipeline().try_process("x = " + "-" * depth + "1")
+    assert (tree is None) != (err is None)
