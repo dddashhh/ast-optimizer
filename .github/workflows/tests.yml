@@ -10,11 +10,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -26,5 +28,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Run tests with coverage
-        run: pytest --cov=ast_optimizer --cov-report=term-missing --cov-report=xml -v
+      - name: Run tests
+        if: always()
+        run: |
+          pytest \
+            --cov=ast_optimizer \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --html=report.html --self-contained-html \
+            -v
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report-py${{ matrix.python-version }}
+          path: report.html
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml-py${{ matrix.python-version }}
+          path: coverage.xml

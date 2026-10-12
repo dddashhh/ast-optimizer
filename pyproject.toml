@@ -16,4 +16,10 @@ pythonpath = ["."]
 addopts = "-q"
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-cov"]
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pytest-html",
+    "hypothesis",
+]
