@@ -16,7 +16,6 @@ pythonpath = ["."]
 addopts = "-q"
 
 [project.optional-dependencies]
-[project.optional-dependencies]
 dev = [
     "pytest",
     "pytest-cov",
