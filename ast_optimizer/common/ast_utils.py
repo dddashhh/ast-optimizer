@@ -6,9 +6,9 @@ import operator
 from _ast import UnaryOp, Constant
 from typing import Dict, Iterable, List, Optional, Set
 
-MAX_FOLDED_SIZE = 4096                                                      
-MAX_FOLDED_BITS = 8192                                                      
-MAX_SHIFT_OR_POW = 1000                                                  
+MAX_FOLDED_SIZE = 4096
+MAX_FOLDED_BITS = 8192
+MAX_SHIFT_OR_POW = 1000
 
 SCOPE_NODES = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
 
@@ -20,7 +20,7 @@ _BIN_OPS = {
 }
 _UNARY_OPS = {ast.USub: operator.neg, ast.UAdd: operator.pos,
               ast.Invert: operator.invert, ast.Not: operator.not_}
-                                                                          
+
 _CMP_OPS = {
     ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt, ast.LtE: operator.le,
     ast.Gt: operator.gt, ast.GtE: operator.ge,
@@ -33,7 +33,7 @@ class _NotFoldable(Exception):
     pass
 
 
-                                                                             
+
 def _check_size(value: object) -> None:
     if isinstance(value, (str, bytes)) and len(value) > MAX_FOLDED_SIZE:
         raise _NotFoldable
@@ -70,7 +70,7 @@ def _eval(node: ast.AST) -> object:
         is_and = isinstance(node.op, ast.And)
         for value_node in node.values:
             result = _eval(value_node)
-            if bool(result) != is_and:                                                 
+            if bool(result) != is_and:
                 break
         return result
     if isinstance(node, ast.Compare):
@@ -112,7 +112,7 @@ def try_fold(node: ast.AST) -> Optional[ast.expr]:
     except _NotFoldable:
         return None
     except (ArithmeticError, TypeError, ValueError, RecursionError, MemoryError):
-        return None                                                             
+        return None
     if isinstance(value, complex):
         return None
     if isinstance(value, float) and not math.isfinite(value):
@@ -120,7 +120,7 @@ def try_fold(node: ast.AST) -> Optional[ast.expr]:
     return make_constant(value)
 
 
-                                                                              
+
 def enclosing_scope(node: ast.AST, parents: Dict[ast.AST, ast.AST]) -> Optional[ast.AST]:
     cur = parents.get(node)
     while cur is not None and not isinstance(cur, SCOPE_NODES):
@@ -165,7 +165,7 @@ def replace_node(parents: Dict[ast.AST, ast.AST], old: ast.AST, new_nodes: Itera
     raise ValueError("Узел не найден среди полей родителя")
 
 
-                                                                          
+
 def names_in(node: ast.AST) -> Set[str]:
     return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
 

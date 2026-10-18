@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import pytest
 
 from ast_optimizer.benchmark import benchmark_file, benchmark_source, generate_synthetic_cases, optimize_source
@@ -46,3 +44,35 @@ def test_file_benchmark_rejects_non_python_file(tmp_path):
 
     with pytest.raises(ValueError):
         benchmark_file(path)
+
+
+def test_optimizer_applies_multiple_candidates_until_fixpoint():
+    source = "result = sum([x * (2 + 3) for x in range(30)])\n"
+
+    result = optimize_source(source)
+
+    assert len(result.applied_optimizations) >= 2
+    assert result.iterations == len(result.applied_optimizations)
+    assert result.termination_reason in {"no_candidates", "no_verified_candidate"}
+    assert result.optimized_source != source
+    assert compile(result.optimized_source, result.filename, "exec")
+
+
+def test_optimizer_stops_at_iteration_limit():
+    source = "result = sum([x * (2 + 3) for x in range(30)])\n"
+
+    result = optimize_source(source, max_iterations=1)
+
+    assert result.iterations == 1
+    assert result.termination_reason == "max_iterations"
+    assert len(result.applied_optimizations) == 1
+
+
+def test_optimizer_stops_when_no_candidates_exist():
+    source = "result = len(\"abc\")\n"
+
+    result = optimize_source(source)
+
+    assert result.optimized_source == source
+    assert result.applied_optimizations == ()
+    assert result.termination_reason == "no_candidates"

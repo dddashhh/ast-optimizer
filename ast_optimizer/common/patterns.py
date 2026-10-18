@@ -10,10 +10,10 @@ _SCOPE_BREAKERS = (ast.Yield, ast.YieldFrom, ast.Await, ast.NamedExpr)
 _GENERATOR_FUNCS = {"sum", "min", "max", "any", "all"}
 
 
-                                                                           
+
 @dataclass
 class AppendLoop:
-    init: ast.Assign                  
+    init: ast.Assign
     list_name: str
     loop: ast.For
     elt: ast.expr
@@ -65,12 +65,12 @@ def match_append_loop(loop: ast.AST, parents: Dict[ast.AST, ast.AST]) -> Optiona
         return None
     name, elt = appended
 
-    init = sibling_before(loop, parents)                                                          
+    init = sibling_before(loop, parents)
     if not _is_empty_list_init(init, name):
         return None
 
     scope = enclosing_scope(loop, parents)
-    if scope is None or isinstance(scope, ast.ClassDef):                                           
+    if scope is None or isinstance(scope, ast.ClassDef):
         return None
 
     parts = [loop.iter, elt] + ([cond] if cond is not None else [])
@@ -78,7 +78,7 @@ def match_append_loop(loop: ast.AST, parents: Dict[ast.AST, ast.AST]) -> Optiona
         if contains_node(part, _SCOPE_BREAKERS) or name in names_in(part):
             return None
 
-                                                                            
+
     target_names = names_in(loop.target)
     inside = {id(n) for n in ast.walk(loop)}
     for n in ast.walk(scope):
@@ -87,7 +87,7 @@ def match_append_loop(loop: ast.AST, parents: Dict[ast.AST, ast.AST]) -> Optiona
     return AppendLoop(init=init, list_name=name, loop=loop, elt=elt, cond=cond)
 
 
-                                                                           
+
 def match_listcomp_call(call: ast.AST, shadowed: Set[str]) -> bool:
     """sum/min/max/any/all([... for ...]) -> то же с генератором."""
     if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)):
@@ -102,24 +102,24 @@ def match_listcomp_call(call: ast.AST, shadowed: Set[str]) -> bool:
     comp = call.args[0]
     if contains_node(comp, (ast.Await,)):
         return False
-                                                                                         
+
     if fname in ("any", "all") and contains_node(comp, (ast.Call,)):
         return False
     return True
 
 
-                                                                      
+
 def match_negated_membership(node: ast.AST) -> bool:
     return (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not)
             and isinstance(node.operand, ast.Compare) and len(node.operand.ops) == 1
             and isinstance(node.operand.ops[0], (ast.In, ast.Is)))
 
 
-                                                                        
+
 def match_dead_branch(node: ast.AST) -> bool:
     if not (isinstance(node, ast.If) and isinstance(node.test, ast.Constant)):
         return False
     removed = node.orelse if node.test.value else node.body
-                                                                
+
     breakers = (ast.Yield, ast.YieldFrom, ast.Global, ast.Nonlocal, ast.NamedExpr)
     return not any(contains_node(stmt, breakers) for stmt in removed)

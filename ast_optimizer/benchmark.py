@@ -26,6 +26,10 @@ class PipelineResult:
     optimization: str
     candidate_count: int
     features: dict[str, float]
+    applied_optimizations: tuple[str, ...] = ()
+    iterations: int = 0
+    termination_reason: str = "no_candidates"
+    candidates_tried: int = 0
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,11 @@ class BenchmarkResult:
     optimized_profile_seconds: float
     baseline_hotspots: tuple[tuple[str, int, int, float, float], ...]
     optimized_hotspots: tuple[tuple[str, int, int, float, float], ...]
+    candidate_count: int
+    applied_optimizations: tuple[str, ...]
+    iterations: int
+    termination_reason: str
+    candidates_tried: int
 
     @property
     def baseline_mean(self) -> float:
@@ -117,31 +126,93 @@ class MLOptimizerStub:
         return max(candidates, key=lambda item: (self.score(item), -item.lineno, -item.col_offset), default=None)
 
 
-def optimize_source(source: str, filename: str = "<input>") -> PipelineResult:
+def _execute_for_verification(source: str, filename: str) -> tuple[bool, object]:
+    try:
+        code = compile(source, filename, "exec")
+        namespace: dict[str, object] = {"__builtins__": __builtins__}
+        exec(code, namespace, namespace)
+        if "result" not in namespace:
+            return False, None
+        return True, namespace["result"]
+    except Exception as exc:
+        return False, (type(exc).__name__, str(exc))
+
+
+def _equivalent_results(original_source: str, candidate_source: str, filename: str) -> bool:
+    original_ok, original_result = _execute_for_verification(original_source, filename)
+    candidate_ok, candidate_result = _execute_for_verification(candidate_source, filename)
+    return original_ok and candidate_ok and original_result == candidate_result
+
+
+def optimize_source(source: str, filename: str = "<input>", max_iterations: int = 100) -> PipelineResult:
+    if max_iterations < 1:
+        raise ValueError("max_iterations должен быть положительным")
     pipeline = InputPipeline()
     analyzer = ASTAnalyzer()
     transformer = ASTTransformer()
     generator = CodeGenerator()
     ml_stub = MLOptimizerStub()
-    tree = pipeline.process(source, filename=filename)
-    analysis = analyzer.analyze(tree)
-    candidate = ml_stub.choose(analysis.candidates)
-    optimized_source = source
-    optimization = "не применена"
-    if candidate is not None:
-        try:
-            transformed = transformer.transform(tree, candidate)
-            optimized_source = generator.generate(transformed).text
-            optimization = candidate.type.value
-        except (CodeGenerationError, TransformError, ValueError, RuntimeError, TypeError):
-            optimization = "не применена: ошибка трансформации"
+    original_tree = pipeline.process(source, filename=filename)
+    current_tree = original_tree
+    current_source = source
+    initial_analysis = analyzer.analyze(current_tree)
+    applied: list[str] = []
+    candidates_tried = 0
+    iterations = 0
+    termination_reason = "max_iterations"
+
+    while iterations < max_iterations:
+        analysis = analyzer.analyze(current_tree)
+        if not analysis.candidates:
+            termination_reason = "no_candidates"
+            break
+        ranked = sorted(
+            analysis.candidates,
+            key=lambda candidate: (
+                ml_stub.score(candidate),
+                -candidate.lineno,
+                -candidate.col_offset,
+                -candidate.node_index,
+            ),
+            reverse=True,
+        )
+        accepted = False
+        for candidate in ranked:
+            candidates_tried += 1
+            try:
+                transformed = transformer.transform(current_tree, candidate)
+                generated = generator.generate(transformed).text
+            except (CodeGenerationError, TransformError, ValueError, RuntimeError, TypeError):
+                continue
+            if generated == current_source:
+                continue
+            if not _equivalent_results(source, generated, filename):
+                continue
+            current_tree = pipeline.process(generated, filename=filename)
+            current_source = generated
+            applied.append(candidate.type.value)
+            iterations += 1
+            accepted = True
+            break
+        if not accepted:
+            termination_reason = "no_verified_candidate"
+            break
+    else:
+        termination_reason = "max_iterations"
+
+    if iterations >= max_iterations and not analyzer.analyze(current_tree).candidates:
+        termination_reason = "no_candidates"
     return PipelineResult(
         filename=filename,
         original_source=source,
-        optimized_source=optimized_source,
-        optimization=optimization,
-        candidate_count=len(analysis.candidates),
-        features=analysis.features.to_vector(),
+        optimized_source=current_source,
+        optimization=", ".join(applied) if applied else "не применена",
+        candidate_count=len(initial_analysis.candidates),
+        features=initial_analysis.features.to_vector(),
+        applied_optimizations=tuple(applied),
+        iterations=iterations,
+        termination_reason=termination_reason,
+        candidates_tried=candidates_tried,
     )
 
 
@@ -212,10 +283,16 @@ def _profile_calls(source: str, filename: str, limit: int = 8) -> tuple[int, int
     return stats.total_calls, stats.prim_calls, stats.total_tt, tuple(hotspots)
 
 
-def benchmark_source(source: str, filename: str = "<input>", repeats: int = 7, warmups: int = 2) -> BenchmarkResult:
+def benchmark_source(
+    source: str,
+    filename: str = "<input>",
+    repeats: int = 7,
+    warmups: int = 2,
+    max_iterations: int = 100,
+) -> BenchmarkResult:
     if repeats < 1 or warmups < 0:
         raise ValueError("repeats должен быть положительным, warmups не может быть отрицательным")
-    pipeline_result = optimize_source(source, filename)
+    pipeline_result = optimize_source(source, filename, max_iterations=max_iterations)
     baseline_times, baseline_value = _measure(source, repeats, warmups, filename)
     optimized_source = pipeline_result.optimized_source
     optimized_times, optimized_value = _measure(optimized_source, repeats, warmups, filename)
@@ -247,22 +324,37 @@ def benchmark_source(source: str, filename: str = "<input>", repeats: int = 7, w
         optimized_profile_seconds=optimized_profile_time,
         baseline_hotspots=baseline_hotspots,
         optimized_hotspots=optimized_hotspots,
+        candidate_count=pipeline_result.candidate_count,
+        applied_optimizations=pipeline_result.applied_optimizations,
+        iterations=pipeline_result.iterations,
+        termination_reason=pipeline_result.termination_reason,
+        candidates_tried=pipeline_result.candidates_tried,
     )
 
 
-def benchmark_file(path: str | Path, repeats: int = 7, warmups: int = 2) -> BenchmarkResult:
+def benchmark_file(
+    path: str | Path, repeats: int = 7, warmups: int = 2, max_iterations: int = 100
+) -> BenchmarkResult:
     file_path = Path(path)
     if file_path.suffix != ".py":
         raise ValueError("Входной файл должен иметь расширение .py")
     source = file_path.read_text(encoding="utf-8")
-    return benchmark_source(source, str(file_path), repeats, warmups)
+    return benchmark_source(source, str(file_path), repeats, warmups, max_iterations)
 
 
-def run_benchmarks(seed: int = 0, size: int = 5000, repeats: int = 7, warmups: int = 2) -> list[BenchmarkResult]:
+def run_benchmarks(
+    seed: int = 0,
+    size: int = 5000,
+    repeats: int = 7,
+    warmups: int = 2,
+    max_iterations: int = 100,
+) -> list[BenchmarkResult]:
     if repeats < 1 or warmups < 0:
         raise ValueError("repeats должен быть положительным, warmups не может быть отрицательным")
-    return [benchmark_source(source, f"{name}.py", repeats, warmups)
-            for name, source in generate_synthetic_cases(seed=seed, size=size)]
+    return [
+        benchmark_source(source, f"{name}.py", repeats, warmups, max_iterations)
+        for name, source in generate_synthetic_cases(seed=seed, size=size)
+    ]
 
 
 def print_report(results: list[BenchmarkResult]) -> None:
@@ -273,6 +365,8 @@ def print_report(results: list[BenchmarkResult]) -> None:
     for result in results:
         print(f"{result.name:<25} {result.optimization[:30]:<30} {result.baseline_mean * 1000:>13.3f} "
               f"{result.optimized_mean * 1000:>12.3f} {result.speedup:>9.3f}x")
+        print(f"  кандидатов найдено: {result.candidate_count}; проверено: {result.candidates_tried}; "
+              f"итераций: {result.iterations}; остановка: {result.termination_reason}")
         print(f"  медиана: {result.baseline_median * 1000:.3f} / {result.optimized_median * 1000:.3f} мс; "
               f"σ: {result.baseline_stdev * 1000:.3f} / {result.optimized_stdev * 1000:.3f} мс")
         print(f"  пиковая память Python, среднее: {result.baseline_memory_peak_mean / 1024:.2f} / "
@@ -307,25 +401,45 @@ def main() -> None:
     parser.add_argument("--size", type=int, default=5000)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--warmups", type=int, default=2)
+    parser.add_argument("--max-iterations", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", help="Куда сохранить сгенерированный оптимизированный код")
     args = parser.parse_args()
     if args.input:
         file_path = Path(args.input)
-        result = optimize_source(file_path.read_text(encoding="utf-8"), str(file_path))
-        benchmark_result = benchmark_source(result.original_source, result.filename, args.repeats, args.warmups)
+        result = optimize_source(
+            file_path.read_text(encoding="utf-8"),
+            str(file_path),
+            max_iterations=args.max_iterations,
+        )
+        benchmark_result = benchmark_source(
+            result.original_source,
+            result.filename,
+            args.repeats,
+            args.warmups,
+            args.max_iterations,
+        )
         if args.output:
             output_source = result.optimized_source if benchmark_result.baseline_result == benchmark_result.optimized_result else result.original_source
             Path(args.output).write_text(output_source, encoding="utf-8")
         print(f"Файл: {result.filename}")
         print(f"Кандидатов найдено: {result.candidate_count}")
-        print(f"Выбранная оптимизация: {benchmark_result.optimization}")
+        print(f"Применённые оптимизации: {benchmark_result.optimization}")
+        print(f"Итераций: {result.iterations}; кандидатов проверено: {result.candidates_tried}; остановка: {result.termination_reason}")
         print(f"Признаки AST: {result.features}")
         print_report([benchmark_result])
         if args.output:
             print(f"Результат сохранён: {args.output}")
     else:
-        print_report(run_benchmarks(seed=args.seed, size=args.size, repeats=args.repeats, warmups=args.warmups))
+        print_report(
+            run_benchmarks(
+                seed=args.seed,
+                size=args.size,
+                repeats=args.repeats,
+                warmups=args.warmups,
+                max_iterations=args.max_iterations,
+            )
+        )
 
 
 if __name__ == "__main__":
