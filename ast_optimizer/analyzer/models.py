@@ -22,7 +22,7 @@ class OptimizationType(str, Enum):
 class OptimizationCandidate:
     type: OptimizationType
     node_index: int
-    node_type: str                                                                 
+    node_type: str
     lineno: int
     col_offset: int
     description: str

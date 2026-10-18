@@ -22,7 +22,7 @@ class ConstantFoldingDetector(ICandidateDetector):
             if try_fold(node) is not None:
                 found.append(ctx.make_candidate(
                     self.optimization_type, node, "Выражение из констант вычисляется заранее"))
-                continue                                                              
+                continue
             stack.extend(ast.iter_child_nodes(node))
         return found
 
