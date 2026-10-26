@@ -102,8 +102,7 @@ def match_listcomp_call(call: ast.AST, shadowed: Set[str]) -> bool:
     comp = call.args[0]
     if contains_node(comp, (ast.Await,)):
         return False
-
-    if fname in ("any", "all") and contains_node(comp, (ast.Call,)):
+    if fname in ("any", "all"):
         return False
     return True
 
@@ -121,5 +120,12 @@ def match_dead_branch(node: ast.AST) -> bool:
         return False
     removed = node.orelse if node.test.value else node.body
 
-    breakers = (ast.Yield, ast.YieldFrom, ast.Global, ast.Nonlocal, ast.NamedExpr)
+    # Удаление присваивания может изменить область видимости имени во всей
+    # функции: имя, присваиваемое в недостижимой ветке, всё равно считается
+    # локальным и при чтении до присваивания вызывает UnboundLocalError.
+    breakers = (
+        ast.Yield, ast.YieldFrom, ast.Global, ast.Nonlocal, ast.NamedExpr,
+        ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr,
+        ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.ExceptHandler,
+    )
     return not any(contains_node(stmt, breakers) for stmt in removed)

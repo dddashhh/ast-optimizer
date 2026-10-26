@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import argparse
-import cProfile
-import pstats
+import json
+import os
 import random
+import signal
 import statistics
+import subprocess
+import sys
+import tempfile
 import time
-import tracemalloc
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Tuple, Any
 
 from ast_optimizer import InputPipeline
 from ast_optimizer.analyzer import ASTAnalyzer
@@ -126,17 +129,130 @@ class MLOptimizerStub:
         return max(candidates, key=lambda item: (self.score(item), -item.lineno, -item.col_offset), default=None)
 
 
+EXECUTION_TIMEOUT_SECONDS = 3.0
+MAX_SOURCE_BYTES = 1_000_000
+MAX_REPEATS = 100
+MAX_WARMUPS = 100
+MAX_ITERATIONS = 500
+
+_CHILD_RUNNER = r'''import cProfile, json, pstats, sys, time, tracemalloc
+__file__ = "<ast_optimizer_child>"
+payload = json.loads(sys.stdin.read())
+source = payload["source"]
+filename = payload.get("filename", "<benchmark>")
+mode = payload.get("mode", "run")
+def safe_value(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [safe_value(item) for item in value]
+    if isinstance(value, dict) and all(isinstance(k, str) for k in value):
+        return {k: safe_value(v) for k, v in value.items()}
+    return {"__unsupported_type__": type(value).__name__}
+def execute():
+    namespace = {"__builtins__": __builtins__, "__file__": filename, "__name__": "__main__"}
+    exec(compile(source, filename, "exec"), namespace, namespace)
+    return namespace.get("result")
+try:
+    code = compile(source, filename, "exec")
+    if mode == "run":
+        value = execute()
+        result = {"ok": True, "value": safe_value(value)}
+    elif mode == "timing":
+        for _ in range(payload["warmups"]): execute()
+        durations = []
+        value = None
+        for _ in range(payload["repeats"]):
+            start = time.perf_counter(); value = execute(); durations.append(time.perf_counter() - start)
+        result = {"ok": True, "durations": durations, "value": safe_value(value)}
+    elif mode == "memory":
+        peaks, currents = [], []
+        for _ in range(payload["repeats"]):
+            tracemalloc.start()
+            try:
+                execute(); current, peak = tracemalloc.get_traced_memory()
+                currents.append(current); peaks.append(peak)
+            finally:
+                tracemalloc.stop()
+        result = {"ok": True, "peaks": peaks, "currents": currents}
+    elif mode == "profile":
+        profiler = cProfile.Profile(); profiler.enable(); execute(); profiler.disable()
+        stats = pstats.Stats(profiler)
+        hotspots = sorted(
+            ((f"{__import__('pathlib').Path(path).name}:{line}({func})", values[1], values[0], values[2], values[3])
+             for (path, line, func), values in stats.stats.items()
+             if path != __file__ and "disable" not in func and "Profiler" not in func),
+            key=lambda item: (item[4], item[1]), reverse=True,
+        )[:payload.get("limit", 8)]
+        result = {"ok": True, "total_calls": stats.total_calls, "primitive_calls": stats.prim_calls,
+                  "profile_seconds": stats.total_tt, "hotspots": hotspots}
+    else:
+        raise ValueError("unsupported mode")
+except BaseException as exc:
+    result = {"ok": False, "error_type": type(exc).__name__, "error": str(exc)[:500]}
+# Prefix makes incidental print() calls by the target program distinguishable.
+print("ASTOPT_RESULT:" + json.dumps(result, allow_nan=False))
+''' 
+
+
+def _isolated_run(source: str, filename: str = "<benchmark>", *, mode: str = "run", **options):
+    if not isinstance(source, str):
+        raise TypeError("source должен быть строкой")
+    if len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
+        raise ValueError(f"Исходный код превышает лимит {MAX_SOURCE_BYTES} байт")
+    payload = {"source": source, "filename": filename, "mode": mode, **options}
+    with tempfile.TemporaryDirectory(prefix="ast-optimizer-") as workdir:
+        command = [sys.executable, "-I", "-c", _CHILD_RUNNER]
+        process = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=workdir,
+            env={"PATH": os.defpath, "PYTHONIOENCODING": "utf-8"},
+            start_new_session=(os.name == "posix"),
+        )
+        try:
+            stdout, stderr = process.communicate(json.dumps(payload), timeout=EXECUTION_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+            process.communicate()
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+            raise TimeoutError(f"Выполнение превысило лимит {EXECUTION_TIMEOUT_SECONDS:g} с") from exc
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+        marker = "ASTOPT_RESULT:"
+        lines = [line[len(marker):] for line in stdout.splitlines() if line.startswith(marker)]
+        if process.returncode != 0 or not lines:
+            detail = stderr[-500:] or "дочерний процесс завершился без результата"
+            raise RuntimeError(f"Изолированный запуск завершился с ошибкой: {detail}")
+        try:
+            result = json.loads(lines[-1])
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Не удалось прочитать результат дочернего процесса") from exc
+        if not result.get("ok"):
+            return result
+        return result
+
+
 def _execute_for_verification(source: str, filename: str) -> tuple[bool, object]:
     try:
-        code = compile(source, filename, "exec")
-        namespace: dict[str, object] = {"__builtins__": __builtins__}
-        exec(code, namespace, namespace)
-        if "result" not in namespace:
+        result = _isolated_run(source, filename)
+        if not result.get("ok"):
+            return False, (result.get("error_type", "ExecutionError"), result.get("error", "ошибка"))
+        value = result.get("value")
+        if isinstance(value, dict) and "__unsupported_type__" in value:
             return False, None
-        return True, namespace["result"]
-    except Exception as exc:
+        return True, value
+    except (TimeoutError, RuntimeError, ValueError) as exc:
         return False, (type(exc).__name__, str(exc))
-
 
 def _equivalent_results(original_source: str, candidate_source: str, filename: str) -> bool:
     original_ok, original_result = _execute_for_verification(original_source, filename)
@@ -145,8 +261,10 @@ def _equivalent_results(original_source: str, candidate_source: str, filename: s
 
 
 def optimize_source(source: str, filename: str = "<input>", max_iterations: int = 100) -> PipelineResult:
-    if max_iterations < 1:
-        raise ValueError("max_iterations должен быть положительным")
+    if not 1 <= max_iterations <= MAX_ITERATIONS:
+        raise ValueError(f"max_iterations должен быть в диапазоне 1..{MAX_ITERATIONS}")
+    if len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
+        raise ValueError(f"Исходный код превышает лимит {MAX_SOURCE_BYTES} байт")
     pipeline = InputPipeline()
     analyzer = ASTAnalyzer()
     transformer = ASTTransformer()
@@ -229,59 +347,37 @@ def generate_synthetic_cases(seed: int = 0, size: int = 5000) -> list[tuple[str,
     ]
 
 
-def _execute(code: object) -> object:
-    namespace: dict[str, object] = {"__builtins__": __builtins__}
-    exec(code, namespace, namespace)
-    return namespace.get("result")
-
-
 def _measure(source: str, repeats: int, warmups: int, filename: str = "<benchmark>") -> tuple[tuple[float, ...], object]:
-    code = compile(source, filename, "exec")
-    for _ in range(warmups):
-        _execute(code)
-    durations = []
-    result = None
-    for _ in range(repeats):
-        start = time.perf_counter()
-        result = _execute(code)
-        durations.append(time.perf_counter() - start)
-    return tuple(durations), result
+    _validate_run_options(repeats, warmups, 100)
+    result = _isolated_run(source, filename, mode="timing", repeats=repeats, warmups=warmups)
+    if not result.get("ok"):
+        raise RuntimeError(f"Ошибка выполнения программы: {result.get('error_type')}: {result.get('error')}")
+    return tuple(result["durations"]), result.get("value")
 
 
 def _measure_memory(source: str, repeats: int, filename: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    code = compile(source, filename, "exec")
-    peaks: list[int] = []
-    currents: list[int] = []
-    for _ in range(repeats):
-        if tracemalloc.is_tracing():
-            tracemalloc.stop()
-        tracemalloc.start()
-        try:
-            result = _execute(code)
-            current, peak = tracemalloc.get_traced_memory()
-            currents.append(current)
-            peaks.append(peak)
-        finally:
-            tracemalloc.stop()
-    return tuple(peaks), tuple(currents)
+    _validate_run_options(repeats, 0, 100)
+    result = _isolated_run(source, filename, mode="memory", repeats=repeats)
+    if not result.get("ok"):
+        raise RuntimeError(f"Ошибка измерения памяти: {result.get('error_type')}: {result.get('error')}")
+    return tuple(result["peaks"]), tuple(result["currents"])
 
 
-def _profile_calls(source: str, filename: str, limit: int = 8) -> tuple[int, int, float, tuple[tuple[str, int, int, float, float], ...]]:
-    code = compile(source, filename, "exec")
-    profiler = cProfile.Profile()
-    profiler.enable()
-    _execute(code)
-    profiler.disable()
-    stats = pstats.Stats(profiler)
-    hotspots = sorted(
-        ((f"{Path(path).name}:{line}({func})", values[1], values[0], values[2], values[3])
-         for (path, line, func), values in stats.stats.items()
-         if path != __file__ and "disable" not in func and "Profiler" not in func),
-        key=lambda item: (item[4], item[1]),
-        reverse=True,
-    )[:limit]
-    return stats.total_calls, stats.prim_calls, stats.total_tt, tuple(hotspots)
+def _profile_calls(source: str, filename: str, limit: int = 8) -> tuple[Any, Any, Any, tuple[tuple[Any], ...]]:
+    result = _isolated_run(source, filename, mode="profile", limit=limit)
+    if not result.get("ok"):
+        raise RuntimeError(f"Ошибка профилирования: {result.get('error_type')}: {result.get('error')}")
+    return (result["total_calls"], result["primitive_calls"], result["profile_seconds"],
+            tuple(tuple(item) for item in result["hotspots"]))
 
+
+def _validate_run_options(repeats: int, warmups: int, max_iterations: int) -> None:
+    if not 1 <= repeats <= MAX_REPEATS:
+        raise ValueError(f"repeats должен быть в диапазоне 1..{MAX_REPEATS}")
+    if not 0 <= warmups <= MAX_WARMUPS:
+        raise ValueError(f"warmups должен быть в диапазоне 0..{MAX_WARMUPS}")
+    if not 1 <= max_iterations <= MAX_ITERATIONS:
+        raise ValueError(f"max_iterations должен быть в диапазоне 1..{MAX_ITERATIONS}")
 
 def benchmark_source(
     source: str,
@@ -290,8 +386,9 @@ def benchmark_source(
     warmups: int = 2,
     max_iterations: int = 100,
 ) -> BenchmarkResult:
-    if repeats < 1 or warmups < 0:
-        raise ValueError("repeats должен быть положительным, warmups не может быть отрицательным")
+    _validate_run_options(repeats, warmups, max_iterations)
+    if len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
+        raise ValueError(f"Исходный код превышает лимит {MAX_SOURCE_BYTES} байт")
     pipeline_result = optimize_source(source, filename, max_iterations=max_iterations)
     baseline_times, baseline_value = _measure(source, repeats, warmups, filename)
     optimized_source = pipeline_result.optimized_source
@@ -338,6 +435,11 @@ def benchmark_file(
     file_path = Path(path)
     if file_path.suffix != ".py":
         raise ValueError("Входной файл должен иметь расширение .py")
+    _validate_run_options(repeats, warmups, max_iterations)
+    if not file_path.is_file():
+        raise ValueError("Входной путь должен указывать на существующий обычный файл")
+    if file_path.stat().st_size > MAX_SOURCE_BYTES:
+        raise ValueError(f"Входной файл превышает лимит {MAX_SOURCE_BYTES} байт")
     source = file_path.read_text(encoding="utf-8")
     return benchmark_source(source, str(file_path), repeats, warmups, max_iterations)
 
@@ -349,8 +451,9 @@ def run_benchmarks(
     warmups: int = 2,
     max_iterations: int = 100,
 ) -> list[BenchmarkResult]:
-    if repeats < 1 or warmups < 0:
-        raise ValueError("repeats должен быть положительным, warmups не может быть отрицательным")
+    _validate_run_options(repeats, warmups, max_iterations)
+    if not 1 <= size <= 100_000:
+        raise ValueError("size должен быть в диапазоне 1..100000")
     return [
         benchmark_source(source, f"{name}.py", repeats, warmups, max_iterations)
         for name, source in generate_synthetic_cases(seed=seed, size=size)
@@ -391,12 +494,14 @@ def print_report(results: list[BenchmarkResult]) -> None:
         speedup = baseline / optimized if optimized else 0.0
         print("-" * 100)
         print(f"Среднее по тестам: исходный {baseline * 1000:.3f} мс; новый {optimized * 1000:.3f} мс; ускорение {speedup:.3f}x")
-        print(f"Проверка результата: {'пройдена' if all(x.baseline_result == x.optimized_result for x in results) else 'ошибка'}")
+        print(f"Smoke check результата: {'пройдена' if all(x.baseline_result == x.optimized_result for x in results) else 'ошибка'}")
         print(f"Измерений на версию: {len(results[0].baseline_seconds)}; прогревочных запусков: задаются параметром --warmups")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Полный цикл AST-оптимизации и сравнения производительности")
+    parser = argparse.ArgumentParser(
+        description="Полный цикл AST-оптимизации и сравнения производительности",
+    )
     parser.add_argument("input", nargs="?", help="Путь к Python-файлу для анализа и benchmark")
     parser.add_argument("--size", type=int, default=5000)
     parser.add_argument("--repeats", type=int, default=7)
@@ -405,41 +510,45 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", help="Куда сохранить сгенерированный оптимизированный код")
     args = parser.parse_args()
-    if args.input:
-        file_path = Path(args.input)
-        result = optimize_source(
-            file_path.read_text(encoding="utf-8"),
-            str(file_path),
-            max_iterations=args.max_iterations,
-        )
-        benchmark_result = benchmark_source(
-            result.original_source,
-            result.filename,
-            args.repeats,
-            args.warmups,
-            args.max_iterations,
-        )
-        if args.output:
-            output_source = result.optimized_source if benchmark_result.baseline_result == benchmark_result.optimized_result else result.original_source
-            Path(args.output).write_text(output_source, encoding="utf-8")
-        print(f"Файл: {result.filename}")
-        print(f"Кандидатов найдено: {result.candidate_count}")
-        print(f"Применённые оптимизации: {benchmark_result.optimization}")
-        print(f"Итераций: {result.iterations}; кандидатов проверено: {result.candidates_tried}; остановка: {result.termination_reason}")
-        print(f"Признаки AST: {result.features}")
-        print_report([benchmark_result])
-        if args.output:
-            print(f"Результат сохранён: {args.output}")
-    else:
-        print_report(
-            run_benchmarks(
-                seed=args.seed,
-                size=args.size,
-                repeats=args.repeats,
-                warmups=args.warmups,
-                max_iterations=args.max_iterations,
+    try:
+        _validate_run_options(args.repeats, args.warmups, args.max_iterations)
+        if not 1 <= args.size <= 100_000:
+            raise ValueError("size должен быть в диапазоне 1..100000")
+        if args.input:
+            file_path = Path(args.input)
+            if file_path.suffix != ".py" or not file_path.is_file():
+                raise ValueError("input должен быть существующим файлом с расширением .py")
+            if file_path.stat().st_size > MAX_SOURCE_BYTES:
+                raise ValueError(f"Входной файл превышает лимит {MAX_SOURCE_BYTES} байт")
+            if args.output and Path(args.output).resolve() == file_path.resolve():
+                raise ValueError("Файл вывода не должен совпадать с исходным файлом")
+            source = file_path.read_text(encoding="utf-8")
+            result = optimize_source(source, str(file_path), max_iterations=args.max_iterations)
+            benchmark_result = benchmark_source(
+                result.original_source, result.filename, args.repeats, args.warmups, args.max_iterations
             )
-        )
+            if args.output:
+                output_source = (result.optimized_source
+                                 if benchmark_result.baseline_result == benchmark_result.optimized_result
+                                 else result.original_source)
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(output_source, encoding="utf-8")
+            print(f"Файл: {result.filename}")
+            print(f"Кандидатов найдено: {result.candidate_count}")
+            print(f"Применённые оптимизации: {benchmark_result.optimization}")
+            print(f"Итераций: {result.iterations}; кандидатов проверено: {result.candidates_tried}; остановка: {result.termination_reason}")
+            print(f"Признаки AST: {result.features}")
+            print_report([benchmark_result])
+            if args.output:
+                print(f"Результат сохранён: {args.output}")
+        else:
+            print_report(run_benchmarks(
+                seed=args.seed, size=args.size, repeats=args.repeats,
+                warmups=args.warmups, max_iterations=args.max_iterations,
+            ))
+    except (OSError, UnicodeError, ValueError, RuntimeError, TimeoutError) as exc:
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":

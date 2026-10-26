@@ -46,3 +46,23 @@ def test_replace_node_inserts_pass_when_block_would_be_empty():
     replace_node(tree.parents, old, [])
 
     assert isinstance(tree.root.body[0].body[0], ast.Pass)
+
+
+def test_match_dead_branch_rejects_assignment_that_changes_local_scope():
+    source = """value = 'global'
+def f():
+    if False:
+        value = 1
+    return value
+"""
+    branch = ast.parse(source).body[1].body[0]
+
+    assert not match_dead_branch(branch)
+
+
+def test_match_listcomp_call_rejects_any_all_short_circuit_cases():
+    any_call = ast.parse("any([obj.value for obj in values])", mode="eval").body
+    all_call = ast.parse("all([obj[index] for index in values])", mode="eval").body
+
+    assert not match_listcomp_call(any_call, set())
+    assert not match_listcomp_call(all_call, set())
