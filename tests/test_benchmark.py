@@ -47,3 +47,34 @@ def test_benchmark_memory_profile_is_separate_from_timing():
     assert len(result.baseline_seconds) == len(result.baseline_memory_peak_bytes) == 2
     assert result.baseline_memory_peak_mean > 0
     assert isinstance(result.memory_reduction_percent, float)
+
+
+def test_execution_runs_in_child_process_not_parent():
+    import os
+    from ast_optimizer.benchmark import _execute_for_verification
+
+    ok, child_pid = _execute_for_verification("import os\nresult = os.getpid()\n", "child.py")
+
+    assert ok is True
+    assert child_pid != os.getpid()
+
+
+def test_execution_times_out(monkeypatch):
+    import pytest
+    import ast_optimizer.benchmark as benchmark
+
+    monkeypatch.setattr(benchmark, "EXECUTION_TIMEOUT_SECONDS", 0.1)
+    with pytest.raises(TimeoutError):
+        benchmark._isolated_run("while True: pass", "timeout.py")
+
+
+def test_benchmark_rejects_excessive_options_and_source_size():
+    import pytest
+    from ast_optimizer.benchmark import benchmark_source, run_benchmarks
+
+    with pytest.raises(ValueError):
+        benchmark_source("result = 1", repeats=101)
+    with pytest.raises(ValueError):
+        run_benchmarks(size=100_001)
+    with pytest.raises(ValueError):
+        benchmark_source("#" + ("x" * 1_000_000))
