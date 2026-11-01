@@ -48,10 +48,18 @@ class HeuristicCostModel:
 
 class LinearCostModel:
     def __init__(self, weights: Mapping[str, float], intercept: float = 1.0,
-                 name: str = "linear-cost-model") -> None:
+                 name: str = "linear-cost-model",
+                 feature_means: Mapping[str, float] | None = None,
+                 feature_scales: Mapping[str, float] | None = None,
+                 min_speedup: float = 1.0) -> None:
         self.weights = {str(k): float(v) for k, v in weights.items()}
         self.intercept = float(intercept)
         self.name = name
+        self.feature_means = {str(k): float(v) for k, v in (feature_means or {}).items()}
+        self.feature_scales = {str(k): float(v) for k, v in (feature_scales or {}).items()}
+        self.min_speedup = float(min_speedup)
+        if self.min_speedup <= 0 or not __import__("math").isfinite(self.min_speedup):
+            raise ValueError("min_speedup должен быть конечным положительным числом")
 
     @classmethod
     def from_json(cls, path: str | Path) -> "LinearCostModel":
@@ -59,10 +67,19 @@ class LinearCostModel:
         if not isinstance(payload, dict) or not isinstance(payload.get("weights", {}), dict):
             raise ValueError("Ожидался JSON-объект с полем weights")
         return cls(payload.get("weights", {}), payload.get("intercept", 1.0),
-                   payload.get("name", "linear-cost-model"))
+                   payload.get("name", "linear-cost-model"),
+                   payload.get("feature_means", {}), payload.get("feature_scales", {}),
+                   payload.get("min_speedup", 1.0))
 
     def predict(self, features: Mapping[str, float]) -> float:
-        prediction = self.intercept + sum(
-            weight * float(features.get(key, 0.0)) for key, weight in self.weights.items()
-        )
-        return max(1.0, prediction)
+        import math
+        prediction = self.intercept
+        for key, weight in self.weights.items():
+            value = float(features.get(key, 0.0))
+            if key in self.feature_means:
+                scale = self.feature_scales.get(key, 1.0) or 1.0
+                value = (value - self.feature_means[key]) / scale
+            prediction += weight * value
+        if not math.isfinite(prediction):
+            return self.min_speedup
+        return max(self.min_speedup, prediction)
