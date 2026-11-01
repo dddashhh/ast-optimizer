@@ -12,7 +12,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Tuple, Any
+from typing import Iterable
 
 from ast_optimizer import InputPipeline
 from ast_optimizer.analyzer import ASTAnalyzer
@@ -260,7 +260,9 @@ def _equivalent_results(original_source: str, candidate_source: str, filename: s
     return original_ok and candidate_ok and original_result == candidate_result
 
 
-def optimize_source(source: str, filename: str = "<input>", max_iterations: int = 100) -> PipelineResult:
+def optimize_source(
+    source: str, filename: str = "<input>", max_iterations: int = 100, model_path: str | Path | None = None
+) -> PipelineResult:
     if not 1 <= max_iterations <= MAX_ITERATIONS:
         raise ValueError(f"max_iterations должен быть в диапазоне 1..{MAX_ITERATIONS}")
     if len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
@@ -270,6 +272,10 @@ def optimize_source(source: str, filename: str = "<input>", max_iterations: int 
     transformer = ASTTransformer()
     generator = CodeGenerator()
     ml_stub = MLOptimizerStub()
+    aceob_model = None
+    if model_path is not None:
+        from ast_optimizer.ml_optimizer.aceob import ACEOBPreferenceModel
+        aceob_model = ACEOBPreferenceModel.from_json(model_path)
     original_tree = pipeline.process(source, filename=filename)
     current_tree = original_tree
     current_source = source
@@ -284,22 +290,45 @@ def optimize_source(source: str, filename: str = "<input>", max_iterations: int 
         if not analysis.candidates:
             termination_reason = "no_candidates"
             break
-        ranked = sorted(
-            analysis.candidates,
-            key=lambda candidate: (
-                ml_stub.score(candidate),
-                -candidate.lineno,
-                -candidate.col_offset,
-                -candidate.node_index,
-            ),
-            reverse=True,
-        )
+        prepared: dict[str, tuple[object, str]] = {}
+        if aceob_model is None:
+            ranked = sorted(
+                analysis.candidates,
+                key=lambda candidate: (
+                    ml_stub.score(candidate),
+                    -candidate.lineno,
+                    -candidate.col_offset,
+                    -candidate.node_index,
+                ),
+                reverse=True,
+            )
+        else:
+            baseline_score = aceob_model.score(current_source)
+            scored_candidates: list[tuple[float, OptimizationCandidate]] = []
+            for candidate in analysis.candidates:
+                try:
+                    transformed = transformer.transform(current_tree, candidate)
+                    generated = generator.generate(transformed).text
+                except (CodeGenerationError, TransformError, ValueError, RuntimeError, TypeError):
+                    continue
+                if generated == current_source:
+                    continue
+                prepared[candidate.id] = (transformed, generated)
+                delta = aceob_model.score(generated) - baseline_score
+                scored_candidates.append((delta, candidate))
+            ranked = [candidate for delta, candidate in sorted(
+                scored_candidates,
+                key=lambda item: (-item[0], item[1].lineno, item[1].col_offset, item[1].node_index),
+            ) if delta > 0.0]
         accepted = False
         for candidate in ranked:
             candidates_tried += 1
             try:
-                transformed = transformer.transform(current_tree, candidate)
-                generated = generator.generate(transformed).text
+                if aceob_model is not None and candidate.id in prepared:
+                    transformed, generated = prepared[candidate.id]
+                else:
+                    transformed = transformer.transform(current_tree, candidate)
+                    generated = generator.generate(transformed).text
             except (CodeGenerationError, TransformError, ValueError, RuntimeError, TypeError):
                 continue
             if generated == current_source:
@@ -363,7 +392,7 @@ def _measure_memory(source: str, repeats: int, filename: str) -> tuple[tuple[int
     return tuple(result["peaks"]), tuple(result["currents"])
 
 
-def _profile_calls(source: str, filename: str, limit: int = 8) -> tuple[Any, Any, Any, tuple[tuple[Any], ...]]:
+def _profile_calls(source: str, filename: str, limit: int = 8) -> tuple[int, int, float, tuple[tuple[str, int, int, float, float], ...]]:
     result = _isolated_run(source, filename, mode="profile", limit=limit)
     if not result.get("ok"):
         raise RuntimeError(f"Ошибка профилирования: {result.get('error_type')}: {result.get('error')}")
@@ -385,11 +414,12 @@ def benchmark_source(
     repeats: int = 7,
     warmups: int = 2,
     max_iterations: int = 100,
+    model_path: str | Path | None = None,
 ) -> BenchmarkResult:
     _validate_run_options(repeats, warmups, max_iterations)
     if len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
         raise ValueError(f"Исходный код превышает лимит {MAX_SOURCE_BYTES} байт")
-    pipeline_result = optimize_source(source, filename, max_iterations=max_iterations)
+    pipeline_result = optimize_source(source, filename, max_iterations=max_iterations, model_path=model_path)
     baseline_times, baseline_value = _measure(source, repeats, warmups, filename)
     optimized_source = pipeline_result.optimized_source
     optimized_times, optimized_value = _measure(optimized_source, repeats, warmups, filename)
@@ -430,7 +460,8 @@ def benchmark_source(
 
 
 def benchmark_file(
-    path: str | Path, repeats: int = 7, warmups: int = 2, max_iterations: int = 100
+    path: str | Path, repeats: int = 7, warmups: int = 2, max_iterations: int = 100,
+    model_path: str | Path | None = None,
 ) -> BenchmarkResult:
     file_path = Path(path)
     if file_path.suffix != ".py":
@@ -441,7 +472,7 @@ def benchmark_file(
     if file_path.stat().st_size > MAX_SOURCE_BYTES:
         raise ValueError(f"Входной файл превышает лимит {MAX_SOURCE_BYTES} байт")
     source = file_path.read_text(encoding="utf-8")
-    return benchmark_source(source, str(file_path), repeats, warmups, max_iterations)
+    return benchmark_source(source, str(file_path), repeats, warmups, max_iterations, model_path=model_path)
 
 
 def run_benchmarks(
@@ -450,12 +481,13 @@ def run_benchmarks(
     repeats: int = 7,
     warmups: int = 2,
     max_iterations: int = 100,
+    model_path: str | Path | None = None,
 ) -> list[BenchmarkResult]:
     _validate_run_options(repeats, warmups, max_iterations)
     if not 1 <= size <= 100_000:
         raise ValueError("size должен быть в диапазоне 1..100000")
     return [
-        benchmark_source(source, f"{name}.py", repeats, warmups, max_iterations)
+        benchmark_source(source, f"{name}.py", repeats, warmups, max_iterations, model_path=model_path)
         for name, source in generate_synthetic_cases(seed=seed, size=size)
     ]
 
@@ -501,6 +533,9 @@ def print_report(results: list[BenchmarkResult]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Полный цикл AST-оптимизации и сравнения производительности",
+        epilog=("Внимание: код запускается в отдельном процессе с тайм-аутом, "
+                "но это не полноценная песочница. Недоверенный код всё ещё может "
+                "обращаться к файлам и сети с правами текущего пользователя."),
     )
     parser.add_argument("input", nargs="?", help="Путь к Python-файлу для анализа и benchmark")
     parser.add_argument("--size", type=int, default=5000)
@@ -509,6 +544,7 @@ def main() -> None:
     parser.add_argument("--max-iterations", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", help="Куда сохранить сгенерированный оптимизированный код")
+    parser.add_argument("--model", help="JSON-модель, обученная на парах ACEOB (опционально)")
     args = parser.parse_args()
     try:
         _validate_run_options(args.repeats, args.warmups, args.max_iterations)
@@ -523,9 +559,10 @@ def main() -> None:
             if args.output and Path(args.output).resolve() == file_path.resolve():
                 raise ValueError("Файл вывода не должен совпадать с исходным файлом")
             source = file_path.read_text(encoding="utf-8")
-            result = optimize_source(source, str(file_path), max_iterations=args.max_iterations)
+            result = optimize_source(source, str(file_path), max_iterations=args.max_iterations, model_path=args.model)
             benchmark_result = benchmark_source(
-                result.original_source, result.filename, args.repeats, args.warmups, args.max_iterations
+                result.original_source, result.filename, args.repeats, args.warmups, args.max_iterations,
+                model_path=args.model,
             )
             if args.output:
                 output_source = (result.optimized_source
@@ -545,7 +582,7 @@ def main() -> None:
         else:
             print_report(run_benchmarks(
                 seed=args.seed, size=args.size, repeats=args.repeats,
-                warmups=args.warmups, max_iterations=args.max_iterations,
+                warmups=args.warmups, max_iterations=args.max_iterations, model_path=args.model,
             ))
     except (OSError, UnicodeError, ValueError, RuntimeError, TimeoutError) as exc:
         parser.error(str(exc))

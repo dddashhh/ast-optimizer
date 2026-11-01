@@ -1,4 +1,8 @@
+from .aceob import ACEOBPreferenceModel, CodePair, load_aceob_pairs, train_aceob_model
 from .models import CandidateScore, CostModel, HeuristicCostModel, LinearCostModel
 from .optimizer import MLOptimizer
 
-__all__ = ["CandidateScore", "CostModel", "HeuristicCostModel", "LinearCostModel", "MLOptimizer"]
+__all__ = [
+    "ACEOBPreferenceModel", "CodePair", "load_aceob_pairs", "train_aceob_model",
+    "CandidateScore", "CostModel", "HeuristicCostModel", "LinearCostModel", "MLOptimizer",
+]

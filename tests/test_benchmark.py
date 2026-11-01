@@ -78,3 +78,41 @@ def test_benchmark_rejects_excessive_options_and_source_size():
         run_benchmarks(size=100_001)
     with pytest.raises(ValueError):
         benchmark_source("#" + ("x" * 1_000_000))
+
+
+def test_optimize_source_accepts_aceob_model(tmp_path):
+    import json
+    from ast_optimizer.benchmark import optimize_source
+
+    model_path = tmp_path / "aceob-model.json"
+    model_path.write_text(json.dumps({
+        "schema_version": 1,
+        "model_type": "aceob_pairwise_ast_ranker",
+        "name": "test-aceob-model",
+        "weights": {"node.For": -10.0, "node.ListComp": 10.0},
+        "means": {},
+        "scales": {},
+    }), encoding="utf-8")
+    source = "values = [1, 2, 3]\nresult = []\nfor x in values:\n    result.append(x * 2)\n"
+    result = optimize_source(source, model_path=model_path, max_iterations=5)
+    assert result.optimized_source
+    assert result.candidate_count >= 1
+
+
+def test_optimize_source_accepts_aceob_model(tmp_path):
+    import json
+    from ast_optimizer.benchmark import optimize_source
+
+    model_path = tmp_path / "aceob-model.json"
+    model_path.write_text(json.dumps({
+        "schema_version": 1,
+        "model_type": "aceob_pairwise_ast_ranker",
+        "name": "test-aceob-model",
+        "weights": {"node.For": -10.0, "node.ListComp": 10.0},
+        "means": {},
+        "scales": {},
+    }), encoding="utf-8")
+    source = "values = [1, 2, 3]\nresult = []\nfor x in values:\n    result.append(x * 2)\n"
+    result = optimize_source(source, model_path=model_path, max_iterations=5)
+    assert result.optimized_source
+    assert result.candidate_count >= 1
