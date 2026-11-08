@@ -319,6 +319,53 @@ class ACEOBPreferenceModel:
         return exp_value / (1.0 + exp_value)
 
 
+def evaluate_aceob_model(
+    model: ACEOBPreferenceModel,
+    dataset_path: str | Path,
+    *,
+    limit: int | None = None,
+) -> dict[str, int | float]:
+    """Evaluate an ACEOB ranker on labeled pairs without fitting or mutating it."""
+    if limit is not None and limit < 1:
+        raise ValueError("limit должен быть >= 1")
+
+    pairs = load_aceob_pairs(dataset_path, limit=limit)
+    correct = 0
+    incorrect = 0
+    tied = 0
+    invalid = 0
+    margins: list[float] = []
+
+    for pair in pairs:
+        try:
+            margin = model.score(pair.efficient_code) - model.score(pair.inefficient_code)
+        except (SyntaxError, ValueError, RecursionError, OverflowError):
+            invalid += 1
+            continue
+        if not math.isfinite(margin):
+            invalid += 1
+            continue
+        margins.append(margin)
+        if margin > 0:
+            correct += 1
+        elif margin < 0:
+            incorrect += 1
+        else:
+            tied += 1
+
+    valid_count = len(margins)
+    return {
+        "pair_count": len(pairs),
+        "valid_pair_count": valid_count,
+        "invalid_pair_count": invalid,
+        "correct_pair_count": correct,
+        "incorrect_pair_count": incorrect,
+        "tied_pair_count": tied,
+        "pairwise_accuracy": correct / valid_count if valid_count else 0.0,
+        "mean_prediction_margin": sum(margins) / valid_count if valid_count else 0.0,
+    }
+
+
 def train_aceob_model(
     dataset_path: str | Path,
     output_path: str | Path,
