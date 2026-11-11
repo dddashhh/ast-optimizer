@@ -148,3 +148,129 @@ def test_aceob_training_rejects_test_split(tmp_path):
     }) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="только на train"):
         train_aceob_model(dataset, tmp_path / "model.json")
+
+
+def test_aceob_evaluation_reports_pairwise_metrics(tmp_path):
+    from ast_optimizer.ml_optimizer.aceob import ACEOBPreferenceModel, evaluate_aceob_model
+
+    dataset = tmp_path / "evaluation.jsonl"
+    dataset.write_text(
+        "\n".join((
+            json.dumps({"inefficient_code": "x = 1", "efficient_code": "x = [1]"}),
+            json.dumps({"inefficient_code": "x = [1]", "efficient_code": "x = 1"}),
+            json.dumps({"inefficient_code": "x=1", "efficient_code": "y=2"}),
+            json.dumps({"inefficient_code": "def broken(:", "efficient_code": "x = [1]"}),
+        )),
+        encoding="utf-8",
+    )
+    model = ACEOBPreferenceModel(
+        weights={"source_chars": 1.0},
+        means={"source_chars": 0.0},
+        scales={"source_chars": 1.0},
+    )
+
+    metrics = evaluate_aceob_model(model, dataset)
+
+    assert metrics["pair_count"] == 4
+    assert metrics["valid_pair_count"] == 3
+    assert metrics["invalid_pair_count"] == 1
+    assert metrics["correct_pair_count"] == 1
+    assert metrics["incorrect_pair_count"] == 1
+    assert metrics["tied_pair_count"] == 1
+    assert metrics["pairwise_accuracy"] == pytest.approx(1 / 3)
+    assert metrics["mean_prediction_margin"] == pytest.approx(0.0)
+
+
+def test_aceob_evaluation_handles_ties_and_rejects_invalid_limit(tmp_path):
+    from ast_optimizer.ml_optimizer.aceob import ACEOBPreferenceModel, evaluate_aceob_model
+
+    dataset = tmp_path / "evaluation.jsonl"
+    dataset.write_text(
+        json.dumps({"inefficient_code": "x = 1", "efficient_code": "y = 1"}) + "\n",
+        encoding="utf-8",
+    )
+    model = ACEOBPreferenceModel(weights={}, means={}, scales={})
+
+    metrics = evaluate_aceob_model(model, dataset)
+
+    assert metrics["tied_pair_count"] == 1
+    assert metrics["pairwise_accuracy"] == 0.0
+    assert metrics["mean_prediction_margin"] == 0.0
+    with pytest.raises(ValueError, match="limit должен быть >= 1"):
+        evaluate_aceob_model(model, dataset, limit=0)
+
+
+def test_aceob_evaluation_rejects_empty_dataset(tmp_path):
+    from ast_optimizer.ml_optimizer.aceob import ACEOBPreferenceModel, evaluate_aceob_model
+
+    dataset = tmp_path / "empty.jsonl"
+    dataset.write_text("\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Не найдены пары кода"):
+        evaluate_aceob_model(ACEOBPreferenceModel({}, {}, {}), dataset)
+
+
+def test_aceob_evaluate_cli_prints_metrics_and_saves_report(tmp_path, monkeypatch, capsys):
+    import json
+    from ast_optimizer.ml_optimizer.__main__ import main
+
+    model_path = tmp_path / "model.json"
+    model_path.write_text(json.dumps({
+        "schema_version": 1,
+        "model_type": "aceob_pairwise_ast_ranker",
+        "name": "test-ranker",
+        "weights": {"source_chars": 1.0},
+        "means": {"source_chars": 0.0},
+        "scales": {"source_chars": 1.0},
+    }), encoding="utf-8")
+    dataset_path = tmp_path / "test.jsonl"
+    dataset_path.write_text(
+        json.dumps({
+            "inefficient_code": "x = 1",
+            "efficient_code": "result = [value for value in values]",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "reports" / "evaluation.json"
+    monkeypatch.setattr("sys.argv", [
+        "ast-optimizer", "aceob-evaluate", str(model_path), str(dataset_path),
+        "--output", str(report_path),
+    ])
+
+    main()
+
+    output = capsys.readouterr().out
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert "ACEOB MODEL EVALUATION" in output
+    assert "Pairwise accuracy:" in output
+    assert report["pair_count"] == 1
+    assert report["valid_pair_count"] == 1
+    assert report["model"] == str(model_path)
+    assert report["dataset"] == str(dataset_path)
+
+
+def test_aceob_evaluate_cli_accepts_limit(tmp_path, monkeypatch, capsys):
+    import json
+    from ast_optimizer.ml_optimizer.__main__ import main
+
+    model_path = tmp_path / "model.json"
+    model_path.write_text(json.dumps({
+        "schema_version": 1,
+        "model_type": "aceob_pairwise_ast_ranker",
+        "weights": {},
+        "means": {},
+        "scales": {},
+    }), encoding="utf-8")
+    dataset_path = tmp_path / "test.jsonl"
+    records = [
+        {"inefficient_code": "x = 1", "efficient_code": "y = 2"},
+        {"inefficient_code": "a = 1", "efficient_code": "b = 2"},
+    ]
+    dataset_path.write_text("\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
+    monkeypatch.setattr("sys.argv", [
+        "ast-optimizer", "aceob-evaluate", str(model_path), str(dataset_path), "--limit", "1",
+    ])
+
+    main()
+
+    assert "Pairs: 1" in capsys.readouterr().out
