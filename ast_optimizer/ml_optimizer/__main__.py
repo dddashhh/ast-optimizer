@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from .dataset import append_jsonl, collect_training_examples
 from .training import train_model
-from .aceob import train_aceob_model, import_aceob_folders
+from .aceob import (
+    ACEOBPreferenceModel,
+    evaluate_aceob_model,
+    import_aceob_folders,
+    train_aceob_model,
+)
 
 
 def main() -> None:
@@ -31,6 +37,12 @@ def main() -> None:
     aceob.add_argument("--epochs", type=int, default=80)
     aceob.add_argument("--learning-rate", type=float, default=0.05)
     aceob.add_argument("--l2", type=float, default=0.001)
+
+    evaluate = commands.add_parser("aceob-evaluate", help="оценить сохранённую ACEOB-модель на отдельном датасете")
+    evaluate.add_argument("model", help="путь к сохранённой ACEOB-модели JSON")
+    evaluate.add_argument("dataset", help="путь к JSON/JSONL/CSV/ZIP с парами кода")
+    evaluate.add_argument("--limit", type=int, help="лимит пар для быстрой проверки")
+    evaluate.add_argument("--output", help="путь для сохранения отчёта в JSON")
 
     importer = commands.add_parser("aceob-import", help="обработать нативные папки/ZIP ACEOB и создать pairwise JSONL")
     importer.add_argument("inputs", nargs="+", help="папки или ZIP-архивы с задачами ACEOB")
@@ -64,6 +76,26 @@ def main() -> None:
         elif args.command == "aceob-import":
             summary = import_aceob_folders(args.inputs, args.output, split=args.split)
             print(f"ACEOB {summary['split']}: записано пар {summary['pairs_written']} в {summary['output']}")
+        elif args.command == "aceob-evaluate":
+            model = ACEOBPreferenceModel.from_json(args.model)
+            metrics = evaluate_aceob_model(model, args.dataset, limit=args.limit)
+            report = {"model": str(args.model), "dataset": str(args.dataset), **metrics}
+            print("ACEOB MODEL EVALUATION")
+            print(f"Model: {args.model}")
+            print(f"Dataset: {args.dataset}")
+            print(f"Pairs: {metrics['pair_count']}")
+            print(f"Valid pairs: {metrics['valid_pair_count']}")
+            print(f"Invalid pairs: {metrics['invalid_pair_count']}")
+            print(f"Correctly ranked: {metrics['correct_pair_count']}")
+            print(f"Incorrectly ranked: {metrics['incorrect_pair_count']}")
+            print(f"Tied: {metrics['tied_pair_count']}")
+            print(f"Pairwise accuracy: {metrics['pairwise_accuracy']:.3f}")
+            print(f"Mean prediction margin: {metrics['mean_prediction_margin']:.6f}")
+            if args.output:
+                output = Path(args.output)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(f"Report saved: {output}")
         elif args.command == "train":
             metrics = train_model(args.dataset, args.output, args.ridge, args.seed)
             print(f"Модель сохранена: {args.output}")
